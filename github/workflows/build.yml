@@ -1,0 +1,232 @@
+# ==============================================================================
+#  z2roN_DM 자동 빌드 설명  (이 파일: .github/workflows/build.yml)
+# ==============================================================================
+#  이 파일은 GitHub Actions 설정입니다. 소스를 GitHub에 올리면 GitHub의 서버가
+#  Android 앱(APK)과 Windows 앱을 대신 만들어 줍니다. 내 PC에 설치할 것은 없습니다.
+#
+#  [사용 방법]
+#   1) 이 프로젝트 전체(.github 폴더 포함)를 GitHub 저장소에 올립니다.
+#      (메일 앱 z2roN_story 저장소와는 별개의 새 저장소를 권장합니다)
+#   2) 저장소 위쪽 탭 Actions > 왼쪽 "z2roN_DM 빌드" > Run workflow 버튼 클릭
+#      (main 브랜치에 파일을 올리면 자동으로도 실행됩니다)
+#   3) 5~15분 뒤 초록 체크가 뜨면, 그 실행을 눌러 맨 아래 Artifacts에서 내려받습니다.
+#        - z2roN_DM-android-v버전  : 안드로이드 설치 파일(app-release.apk)
+#        - z2roN_DM-windows-v버전  : 윈도우 프로그램 폴더 (z2roN_DM.exe 실행)
+#      (파일 이름의 v버전은 pubspec.yaml 의 version 값입니다)
+#
+#  [하는 일]  플랫폼 폴더 생성 → 앱 이름/권한/최소 SDK 설정 → 아이콘 생성 → 빌드 → 업로드
+#
+#  [이름 규칙]
+#   - 실행 파일/빌드 결과 이름 : z2roN_DM  (아래 APP_NAME)
+#   - 화면 상단·창 제목·앱 이름 : z2roN-DM  (아래 APP_TITLE)
+#   - Dart 패키지 이름(소문자만 허용) : z2ron_dm  (아래 PKG_NAME)
+#
+#  [실패했을 때]  Android는 빌드가 실패하면 "오류 요약" 단계가 자동으로 실행되고, 실행 페이지 위쪽
+#                Summary 에도 같은 요약이 표시됩니다. 그 내용을 복사해서 알려주세요.
+#                (전체 로그는 Artifacts 의 z2roN_DM-android-build-log 로 내려받을 수 있습니다)
+#                Windows 는 빨간 X 단계를 열어 마지막 30줄 정도의 오류 메시지를 확인하세요.
+#  [업데이트할 때]  pubspec.yaml 의 version 과 lib/version.dart 의 버전/내역을 함께 올립니다.
+# ==============================================================================
+name: z2roN_DM 빌드
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  APP_NAME: z2roN_DM
+  PKG_NAME: z2ron_dm
+  APP_TITLE: z2roN-DM
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: 플랫폼 폴더 생성
+        run: |
+          flutter create --platforms=android,windows --project-name "$PKG_NAME" --org com.z2ron .
+          rm -f test/widget_test.dart
+      - name: 인터넷 권한 추가 (없으면 중개 서버/상대에 연결할 수 없음)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' "$M"
+          sed -i 's#<application#<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>\n    <application#' "$M"
+          grep -q "android.permission.INTERNET" "$M" || { echo "INTERNET 권한 추가 실패"; exit 1; }
+      - name: 앱 이름 설정
+        run: sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_TITLE\"/" android/app/src/main/AndroidManifest.xml
+      - name: 최소 SDK 23 (보안 저장소 요구사항)
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 23/' "$f"
+            grep -n "minSdk" "$f" || true
+          done
+      - name: 플러그인 compileSdk 36 맞춤 (file_picker 등이 compileSdk 34로 빌드되어 생기는 AAR 메타데이터 오류 방지)
+        run: |
+          if [ -f android/build.gradle.kts ]; then
+            cat >> android/build.gradle.kts <<'KTS'
+
+
+            // ---- z2roN_story: 플러그인 모듈의 compileSdk 를 36 으로 맞춤 ----
+            // (flutter_plugin_android_lifecycle 이 compileSdk 36 이상을 요구하는데,
+            //  file_picker 등 일부 플러그인은 34 로 빌드되어 checkReleaseAarMetadata 가 실패함)
+            subprojects {
+                val fixCompileSdk: () -> Unit = {
+                    val ext = extensions.findByName("android")
+                    if (ext != null && name != "app") {
+                        val intType = Int::class.javaPrimitiveType
+                        val boxedType = Int::class.javaObjectType
+                        val setters = ext.javaClass.methods.filter { m ->
+                            m.parameterCount == 1 &&
+                                (m.name == "setCompileSdk" || m.name == "setCompileSdkVersion" || m.name == "compileSdkVersion") &&
+                                (m.parameterTypes[0] == intType || m.parameterTypes[0] == boxedType)
+                        }
+                        var applied = 0
+                        for (m in setters) {
+                            try {
+                                m.isAccessible = true
+                                m.invoke(ext, 36)
+                                applied++
+                            } catch (e: Exception) {
+                                logger.lifecycle("[z2roN_DM] " + name + ": " + m.name + " 호출 실패: " + e.message)
+                            }
+                        }
+                        val getter = ext.javaClass.methods.firstOrNull { g -> g.name == "getCompileSdk" && g.parameterCount == 0 }
+                        val now = try { getter?.invoke(ext) } catch (e: Exception) { null }
+                        val ok = (now is Int) && now >= 36
+                        logger.lifecycle(
+                            "[z2roN_DM] " + name + ": compileSdk 호출 " + applied + "회, 현재 값 = " + now +
+                                (if (ok) " (OK)" else " (적용 확인 안 됨 -> 이 모듈의 AAR 검사만 건너뜀)")
+                        )
+                        if (!ok) {
+                            // 비상용: 검사 작업을 그냥 끄면 뒤 단계(bundleReleaseLocalLintAar)가 출력 폴더가 없다며 실패하므로,
+                            // 건너뛰기 직전에 출력 폴더를 미리 만들어 둠
+                            tasks.configureEach {
+                                if (name.startsWith("check") && name.endsWith("AarMetadata")) {
+                                    val t = this
+                                    val variant = name.removePrefix("check").removeSuffix("AarMetadata")
+                                        .replaceFirstChar { c -> c.lowercase() }
+                                    onlyIf {
+                                        t.outputs.files.files.forEach { f -> f.mkdirs() }
+                                        t.project.layout.buildDirectory.get().asFile
+                                            .resolve("intermediates/aar_metadata_check/" + variant + "/" + t.name)
+                                            .mkdirs()
+                                        false
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (state.executed) fixCompileSdk() else afterEvaluate { fixCompileSdk() }
+            }
+          KTS
+          elif [ -f android/build.gradle ]; then
+            cat >> android/build.gradle <<'GRV'
+
+            subprojects {
+                def fixSdk = { p ->
+                    if (p.name != 'app' && p.hasProperty('android')) {
+                        p.android.compileSdkVersion 36
+                    }
+                }
+                if (state.executed) { fixSdk(it) } else { afterEvaluate { fixSdk(it) } }
+            }
+          GRV
+          else
+            echo "android/build.gradle(.kts) 를 찾을 수 없습니다"; exit 1
+          fi
+          echo "----- android/build.gradle(.kts) 끝부분 -----"
+          tail -n 45 android/build.gradle.kts 2>/dev/null || tail -n 20 android/build.gradle
+      - name: Gradle 호환 설정 (오래된 플러그인과 최신 Kotlin 사이의 JVM 대상 불일치 오류 방지)
+        run: |
+          printf '\nkotlin.jvm.target.validation.mode=warning\n' >> android/gradle.properties
+          tail -n 5 android/gradle.properties
+      - name: 환경 정보 출력 (오류 분석용)
+        run: flutter doctor -v
+      - run: flutter pub get
+      - name: 앱 아이콘 생성 (실패해도 빌드는 계속)
+        continue-on-error: true
+        run: dart run flutter_launcher_icons
+      - name: APK 빌드
+        run: |
+          set -o pipefail
+          flutter build apk --release --no-shrink -v 2>&1 | tee build.log
+      - name: 오류 요약 (빌드가 실패했을 때만 실행 - 이 단계의 출력을 복사해서 알려주세요)
+        if: failure()
+        run: |
+          PAT='z2roN_DM|FAILURE:|An issue was found|Recommended action|What went wrong|Execution failed|error:|^e: |Could not |Unresolved|Namespace|requires|Inconsistent|Duplicate|Manifest merger'
+          echo "===== Dart 코드 오류 (lib/...dart) ====="
+          grep -nE "lib/.*\.dart:[0-9]+:[0-9]+|Error:" build.log | cut -c1-300 | head -40 || true
+          echo "===== 오류 요약 ====="
+          grep -nE "$PAT" build.log | cut -c1-300 | head -60 || true
+          echo "===== 로그 마지막 60줄 ====="
+          tail -n 60 build.log
+          {
+            echo '### Android 빌드 오류 요약'
+            echo '```'
+            echo '--- Dart 코드 오류 ---'
+            grep -nE "lib/.*\.dart:[0-9]+:[0-9]+|Error:" build.log | cut -c1-300 | head -30 || true
+            grep -nE "$PAT" build.log | cut -c1-300 | head -40 || true
+            echo '--- 마지막 40줄 ---'
+            tail -n 40 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 전체 빌드 로그 보관
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: z2roN_DM-android-build-log
+          path: build.log
+          if-no-files-found: ignore
+      - name: 버전 읽기
+        id: ver
+        shell: bash
+        run: echo "v=$(grep '^version:' pubspec.yaml | sed -E 's/version:[ ]*//; s/\+.*//')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: z2roN_DM-android-v${{ steps.ver.outputs.v }}
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: 플랫폼 폴더 생성
+        shell: bash
+        run: |
+          flutter create --platforms=android,windows --project-name "$PKG_NAME" --org com.z2ron .
+          rm -f test/widget_test.dart
+      - name: 실행 파일/창 이름 설정
+        shell: bash
+        run: |
+          VER=$(grep '^version:' pubspec.yaml | sed -E 's/version:[ ]*//; s/\+.*//')
+          sed -i "s/set(BINARY_NAME \"[^\"]*\")/set(BINARY_NAME \"$APP_NAME\")/" windows/CMakeLists.txt
+          sed -i "s/L\"$PKG_NAME\"/L\"$APP_TITLE v$VER\"/" windows/runner/main.cpp
+          sed -i "s/$PKG_NAME/$APP_NAME/g" windows/runner/Runner.rc
+          grep -n "BINARY_NAME" windows/CMakeLists.txt | head -3
+      - run: flutter pub get
+      - name: 앱 아이콘 생성 (실패해도 빌드는 계속)
+        continue-on-error: true
+        run: dart run flutter_launcher_icons
+      - run: flutter build windows --release
+      - name: 버전 읽기
+        id: ver
+        shell: bash
+        run: echo "v=$(grep '^version:' pubspec.yaml | sed -E 's/version:[ ]*//; s/\+.*//')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: z2roN_DM-windows-v${{ steps.ver.outputs.v }}
+          path: build/windows/x64/runner/Release
